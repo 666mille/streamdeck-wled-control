@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>WLED Settings</title>
+    <script src="sdpi-components.js"></script>
+    <style>
+        .scan-btn { margin-top: 10px; width: 100%; }
+        #scanResult { font-size: 11px; color: #ccc; margin-top: 5px; white-space: pre-line; }
+        #foundSelect { margin-top: 5px; width: 100%; }
+        #relayError { 
+            color: #ff5555; 
+            font-size: 11px; 
+            margin-top: 2px; 
+            display: none; 
+        }
+    </style>
+  </head>
+  <body>
+    <sdpi-item label="WLED IP Address">
+      <sdpi-textfield 
+        placeholder="e.g. 192.168.1.50 or wled.local" 
+        id="ipField"
+      ></sdpi-textfield>
+    </sdpi-item>
+  
+    <sdpi-item label="Network Scanner">
+        <sdpi-button class="scan-btn" onclick="scanNetwork()">Scan All Interfaces</sdpi-button>
+        <sdpi-select id="foundSelect" label="Found Devices"></sdpi-select>
+        <p id="scanResult"></p>
+    </sdpi-item>
+
+    <sdpi-item label="Multi Relay (Usermod)">
+        <sdpi-checkbox id="relayCheck" setting="showRelay" label="Enable Relay Mode" disabled></sdpi-checkbox>
+        <div id="relayError">MultiRelay Usermod not detected via JSON!</div>
+    </sdpi-item>
+    
+    <sdpi-item label="Select Relay">
+        <sdpi-select id="relaySelect" setting="relayId" label="Target Relay">
+            <option value="0">Relay 0 (Default)</option>
+        </sdpi-select>
+    </sdpi-item>
+
+    <sdpi-item label="Offline Indication">
+        <sdpi-checkbox setting="showOfflineColor" label="Show Color when Offline"></sdpi-checkbox>
+    </sdpi-item>
+    <sdpi-item label="Offline Color">
+        <sdpi-color setting="offlineColor" default="#FF9800" label="Select Color"></sdpi-color>
+    </sdpi-item>
+
+    <script src="wled-inspector.js"></script>
+  </body>
+</html>

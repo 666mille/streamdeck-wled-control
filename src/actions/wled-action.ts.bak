@@ -1,0 +1,556 @@
+import streamDeck, {
+  action,
+  SingletonAction,
+  type WillAppearEvent,
+  type WillDisappearEvent,
+  type DidReceiveSettingsEvent,
+  type DialDownEvent,
+  type DialRotateEvent,
+  type TouchTapEvent,
+  type JsonObject,
+  LogLevel,
+} from "@elgato/streamdeck";
+import { Buffer } from "node:buffer";
+
+// --- TYPES ---
+
+type ControlMode = "BRIGHTNESS" | "EFFECT" | "PRESET" | "PALETTE";
+
+interface WledState {
+  on: boolean;
+  bri: number; // 0-255
+  ps: number;  // Current Preset ID
+  pl: number;  // Current Playlist ID
+  seg: { fx: number; sx: number; ix: number; pal: number }[];
+}
+
+interface WledInfo {
+  name: string;
+  ver: string;
+  vid: number;
+}
+
+type WledSettings = JsonObject & {
+  ipAddress?: string;
+  mode?: ControlMode;
+};
+
+// Cache for WLED data per context
+interface ContextCache {
+  effects: string[];
+  palettes: string[];
+  presets: { id: number; name: string }[];
+  state: WledState | null;
+  lastUpdate: number;
+  ip: string | null;
+  
+  currentMode: ControlMode;
+  infoName: string;
+  lastError: string | null;
+  action: any; // Crash-Schutz
+
+  // Selection Logic
+  selectionActive: boolean;
+  pendingMode: ControlMode;
+}
+
+const log = streamDeck.logger.createScope("WledAction");
+
+@action({ UUID: "com.holgermilz.wled-control" })
+export class WledAction extends SingletonAction<WledSettings> {
+  private cache = new Map<string, ContextCache>();
+  private activeIntervals = new Map<string, NodeJS.Timeout>();
+  private selectModeTimeouts = new Map<string, NodeJS.Timeout>();
+
+  // --- HELPER ---
+
+  private cleanIp(ip: string | undefined | null): string | null {
+    if (!ip) return null;
+    let clean = ip.trim();
+    clean = clean.replace(/^https?:\/\//, ''); 
+    clean = clean.replace(/\/+$/, '');
+    clean = clean.replace(/[^\x20-\x7E]/g, ''); 
+    return clean || null;
+  }
+
+  // Explicit return type Promise<Response> to satisfy TypeScript strict mode
+  private async fetchWithTimeout(url: string, options: RequestInit = {}, timeout = 2500): Promise<Response> {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeout);
+    try {
+        const response = await fetch(url, {
+            ...options,
+            signal: controller.signal
+        });
+        return response;
+    } catch (e: any) {
+        if (e.name === 'AbortError') throw new Error("Timeout");
+        throw e;
+    } finally {
+        clearTimeout(id);
+    }
+  }
+
+  // --- TIMEOUTS (Selection Mode) ---
+
+  private clearSelectTimeout(context: string) {
+      if (this.selectModeTimeouts.has(context)) {
+          const t = this.selectModeTimeouts.get(context);
+          if (t) clearTimeout(t);
+          this.selectModeTimeouts.delete(context);
+      }
+  }
+
+  private startSelectTimeout(actionObj: any, context: string) {
+      this.clearSelectTimeout(context);
+      const t = setTimeout(() => {
+          const c = this.cache.get(context);
+          if (c && c.selectionActive) {
+              c.selectionActive = false;
+              c.pendingMode = c.currentMode;
+              log.info("Select mode timeout reached, reverting.");
+              this.updateDisplay(actionObj, context);
+          }
+      }, 3000); 
+      this.selectModeTimeouts.set(context, t);
+  }
+
+  // --- LIFECYCLE ---
+
+  override onWillAppear(ev: WillAppearEvent<WledSettings>): void {
+    const settings = ev.payload.settings;
+    const cleanIp = this.cleanIp(settings.ipAddress);
+    
+    if (!this.cache.has(ev.action.id)) {
+      this.cache.set(ev.action.id, {
+        effects: [],
+        palettes: [],
+        presets: [],
+        state: null,
+        lastUpdate: 0,
+        ip: cleanIp,
+        currentMode: settings.mode || "BRIGHTNESS",
+        infoName: "WLED",
+        lastError: cleanIp ? "Connecting..." : "No IP Set",
+        action: ev.action, 
+        selectionActive: false,
+        pendingMode: settings.mode || "BRIGHTNESS"
+      });
+    } else {
+        const c = this.cache.get(ev.action.id);
+        if(c) {
+            c.ip = cleanIp;
+            c.action = ev.action;
+        }
+    }
+
+    const c = this.cache.get(ev.action.id);
+    if(c && c.ip) {
+        this.fetchAll(ev.action.id, c.ip);
+    } else {
+        this.updateDisplay(ev.action, ev.action.id);
+    }
+
+    this.startPolling(ev.action);
+  }
+
+  override onWillDisappear(ev: WillDisappearEvent<WledSettings>): void {
+    const timer = this.activeIntervals.get(ev.action.id);
+    if (timer) clearInterval(timer);
+    this.activeIntervals.delete(ev.action.id);
+    this.clearSelectTimeout(ev.action.id);
+  }
+
+  override onDidReceiveSettings(ev: DidReceiveSettingsEvent<WledSettings>): void {
+    const settings = ev.payload.settings;
+    const clean = this.cleanIp(settings.ipAddress);
+    const c = this.cache.get(ev.action.id);
+    
+    if(c) { 
+        c.ip = clean; 
+        c.action = ev.action;
+        if(settings.mode) c.currentMode = settings.mode; 
+    }
+
+    if (clean) {
+      this.fetchAll(ev.action.id, clean);
+    } else {
+      if(c) c.lastError = "No IP";
+      this.updateDisplay(ev.action, ev.action.id);
+    }
+  }
+
+  // --- INTERACTION ---
+
+  override async onDialDown(ev: DialDownEvent<WledSettings>): Promise<void> {
+    const c = this.cache.get(ev.action.id);
+    if (!c || !c.ip) { ev.action.showAlert(); return; }
+    
+    if (c.selectionActive) {
+        this.clearSelectTimeout(ev.action.id);
+        c.selectionActive = false;
+        c.currentMode = c.pendingMode;
+        
+        // Speichern
+        ev.action.setSettings({ ...ev.payload.settings, mode: c.currentMode });
+        this.updateDisplay(ev.action, ev.action.id);
+        return;
+    }
+
+    c.selectionActive = true;
+    c.pendingMode = c.currentMode;
+    this.startSelectTimeout(ev.action, ev.action.id);
+    this.updateDisplay(ev.action, ev.action.id);
+  }
+
+  override async onTouchTap(ev: TouchTapEvent<WledSettings>): Promise<void> {
+     this.togglePower(ev.action, ev.action.id);
+  }
+
+  override async onDialRotate(ev: DialRotateEvent<WledSettings>): Promise<void> {
+    const c = this.cache.get(ev.action.id);
+    if (!c || !c.ip) return;
+
+    const ticks = ev.payload.ticks;
+
+    if (c.selectionActive) {
+        this.cyclePendingMode(c, ticks);
+        this.startSelectTimeout(ev.action, ev.action.id);
+        this.updateDisplay(ev.action, ev.action.id);
+        return;
+    }
+
+    switch (c.currentMode) {
+        case "BRIGHTNESS": this.changeBrightness(ev.action, c, ticks); break;
+        case "EFFECT": this.changeEffect(ev.action, c, ticks); break;
+        case "PRESET": this.changePreset(ev.action, c, ticks); break;
+        case "PALETTE": this.changePalette(ev.action, c, ticks); break;
+    }
+  }
+
+  // --- LOGIC ---
+
+  private cyclePendingMode(c: ContextCache, ticks: number) {
+      const modes: ControlMode[] = ["BRIGHTNESS", "EFFECT", "PALETTE", "PRESET"];
+      let idx = modes.indexOf(c.pendingMode);
+      if (idx === -1) idx = 0;
+      
+      if (ticks > 0) {
+          idx++;
+          if (idx >= modes.length) idx = 0;
+      } else {
+          idx--;
+          if (idx < 0) idx = modes.length - 1;
+      }
+      c.pendingMode = modes[idx];
+  }
+
+  private startPolling(actionObj: any) {
+    if (this.activeIntervals.has(actionObj.id)) return;
+    const timer = setInterval(() => {
+      const c = this.cache.get(actionObj.id);
+      const safeAction = c?.action || actionObj;
+
+      if (c && c.ip && !c.selectionActive) {
+        this.fetchState(actionObj.id, c.ip).then(() => {
+             this.updateDisplay(safeAction, actionObj.id);
+        });
+      }
+    }, 2500);
+    this.activeIntervals.set(actionObj.id, timer);
+  }
+
+  // --- WLED API CALLS ---
+
+  private async fetchAll(context: string, ip: string) {
+    const c = this.cache.get(context);
+    if(!c) return;
+
+    try {
+      log.info(`Fetching /json from ${ip}...`);
+
+      const res = await this.fetchWithTimeout(`http://${ip}/json`);
+      if(!res.ok) throw new Error(`API: ${res.status}`);
+      
+      const data = (await res.json()) as any;
+
+      if(data.state) c.state = data.state;
+      if(data.info) c.infoName = data.info.name;
+
+      if(Array.isArray(data.effects)) c.effects = data.effects as string[];
+      if(Array.isArray(data.palettes)) c.palettes = data.palettes as string[];
+
+      try {
+         const resPre = await this.fetchWithTimeout(`http://${ip}/presets.json`);
+         if(resPre.ok) {
+             const preData = (await resPre.json()) as any;
+             this.parsePresets(c, preData);
+         }
+      } catch(e) {}
+
+      c.lastError = null; 
+      if (c.action) this.updateDisplay(c.action, context);
+
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      log.error(`Fetch Error: ${msg}`);
+      c.lastError = msg || "Conn Error";
+      if (c.action) this.updateDisplay(c.action, context);
+    }
+  }
+
+  private parsePresets(c: ContextCache, presetsData: any) {
+     const presetsList: { id: number; name: string }[] = [];
+     if (typeof presetsData === 'object' && presetsData !== null) {
+        for (const [key, val] of Object.entries(presetsData)) {
+            if (key === "0") continue;
+            if (!val || Object.keys(val as object).length === 0) continue;
+
+            const name = (val as any).n ? (val as any).n : `Preset ${key}`;
+            presetsList.push({ id: parseInt(key), name: name });
+        }
+     }
+     presetsList.sort((a,b) => a.id - b.id);
+     c.presets = presetsList;
+  }
+
+  private async fetchState(context: string, ip: string) {
+    const c = this.cache.get(context);
+    if(!c) return;
+
+    try {
+      const res = await this.fetchWithTimeout(`http://${ip}/json/state`);
+      if(res.ok) {
+          c.state = (await res.json()) as WledState;
+          c.lastError = null;
+      }
+    } catch (e) {}
+  }
+
+  private async sendJson(ip: string, data: any) {
+    try {
+      fetch(`http://${ip}/json/state`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      }).catch(() => {});
+    } catch (e) {}
+  }
+
+  // --- CHANGE FUNCTIONS ---
+
+  private changeBrightness(actionObj: any, cache: ContextCache, ticks: number) {
+    let newBri = (cache.state?.bri || 0) + (ticks * 10);
+    if (newBri > 255) newBri = 255;
+    if (newBri < 0) newBri = 0;
+    
+    if(cache.state) cache.state.bri = newBri;
+    this.sendJson(cache.ip!, { bri: newBri });
+    this.updateDisplay(actionObj, actionObj.id); 
+  }
+
+  private changeEffect(actionObj: any, cache: ContextCache, ticks: number) {
+     if(!cache.effects.length) return;
+     let currentFx = cache.state?.seg[0]?.fx || 0;
+     let newFx = currentFx + ticks;
+     if (newFx >= cache.effects.length) newFx = 0;
+     if (newFx < 0) newFx = cache.effects.length - 1;
+
+     if(cache.state && cache.state.seg[0]) cache.state.seg[0].fx = newFx;
+     this.sendJson(cache.ip!, { seg: [{ id: 0, fx: newFx }] });
+     this.updateDisplay(actionObj, actionObj.id);
+  }
+
+  private changePalette(actionObj: any, cache: ContextCache, ticks: number) {
+     if(!cache.palettes.length) return;
+     let currentPal = cache.state?.seg[0]?.pal || 0;
+     let newPal = currentPal + ticks;
+     if (newPal >= cache.palettes.length) newPal = 0;
+     if (newPal < 0) newPal = cache.palettes.length - 1;
+
+     if(cache.state && cache.state.seg[0]) cache.state.seg[0].pal = newPal;
+     this.sendJson(cache.ip!, { seg: [{ id: 0, pal: newPal }] });
+     this.updateDisplay(actionObj, actionObj.id);
+  }
+
+  private changePreset(actionObj: any, cache: ContextCache, ticks: number) {
+     if (!cache.presets.length) return;
+     
+     let currentIdx = cache.presets.findIndex(p => p.id === cache.state?.ps);
+     if (currentIdx === -1) currentIdx = 0; 
+
+     let newIdx = currentIdx + ticks;
+     if (newIdx >= cache.presets.length) newIdx = 0;
+     if (newIdx < 0) newIdx = cache.presets.length - 1;
+
+     const targetPreset = cache.presets[newIdx];
+     if(cache.state) cache.state.ps = targetPreset.id;
+     this.sendJson(cache.ip!, { ps: targetPreset.id });
+     this.updateDisplay(actionObj, actionObj.id);
+  }
+
+  private togglePower(actionObj: any, context: string) {
+     const c = this.cache.get(context);
+     if (!c || !c.ip) return;
+     const newState = !(c.state?.on || false);
+     if(c.state) c.state.on = newState;
+     this.sendJson(c.ip, { on: newState });
+     this.updateDisplay(actionObj, context);
+  }
+
+  // --- VISUALS (SVG GENERATION) ---
+
+  private updateDisplay(actionObj: any, context: string) {
+    const c = this.cache.get(context);
+    if(!actionObj || !c) return;
+
+    if (!c.ip) {
+        // ERROR: No IP Address (Rechtsbündig durch Logic unten)
+        this.sendSvg(actionObj, "WLED", "SETUP", "No IP Address", true);
+        return;
+    }
+    if (c.lastError && !c.state) {
+        this.sendSvg(actionObj, "WLED", "OFFLINE", c.lastError, true);
+        return;
+    }
+    if (!c.state) {
+        this.sendSvg(actionObj, c.infoName, "LOADING", "Connecting...", false);
+        return;
+    }
+
+    if (c.selectionActive) {
+        let modeDisplay = c.pendingMode as string;
+        if (modeDisplay === "BRIGHTNESS") modeDisplay = "BRIGHTN"; 
+        
+        this.sendSvg(actionObj, c.infoName, "SELECT", modeDisplay, false, true);
+        return;
+    }
+
+    let label = "";
+    let value = "";
+    let percentage = -1; 
+
+    switch (c.currentMode) {
+        case "BRIGHTNESS":
+            label = "BRIGHTN";
+            const bri = c.state.bri || 0;
+            const pct = Math.round((bri / 255) * 100);
+            value = `${pct}%`; 
+            percentage = pct;
+            break;
+        case "EFFECT":
+            label = "EFFECT";
+            const fxId = c.state.seg[0]?.fx || 0;
+            value = c.effects[fxId] || `ID ${fxId}`;
+            break;
+        case "PALETTE":
+            label = "PALETTE";
+            const palId = c.state.seg[0]?.pal || 0;
+            value = c.palettes[palId] || `ID ${palId}`;
+            break;
+        case "PRESET":
+            label = "PRESET";
+            if (c.presets.length === 0) {
+                this.sendSvg(actionObj, c.infoName, "PRESET", "No Preset Configured", true);
+                return;
+            }
+            const psId = c.state.ps;
+            const pObj = c.presets.find(p => p.id === psId);
+            value = pObj ? pObj.name : (psId > 0 ? `ID ${psId}` : "None");
+            break;
+    }
+
+    this.sendSvg(actionObj, c.infoName, label, value, false, false, percentage);
+  }
+
+  private sendSvg(
+      actionObj: any, 
+      deviceName: string, 
+      modeLabel: string, 
+      mainText: string, 
+      isError: boolean, 
+      isSelectMode: boolean = false,
+      percentage: number = -1
+  ) {
+      const svg = this.generateSvg(deviceName, modeLabel, mainText, isError, isSelectMode, percentage);
+      const base64 = `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
+      const payload: any = { full_display: base64, title: "", value: "", indicator: { value: 0, enabled: false } };
+      actionObj.setFeedback(payload);
+  }
+
+  private generateSvg(
+      deviceName: string, 
+      modeLabel: string, 
+      mainText: string, 
+      isError: boolean, 
+      isSelectMode: boolean,
+      percentage: number
+  ): string {
+      const BG_NORMAL = "#000000";
+      const BG_SELECT = "#3984E9"; 
+      const BG_ERROR  = "#AA0000"; 
+      
+      const TXT_WHITE = "#FFFFFF";
+      const TXT_BLUE  = "#3984E9";
+      const TXT_GREY  = "#888888";
+
+      let bg = BG_NORMAL;
+      if (isError) bg = BG_ERROR;
+      else if (isSelectMode) bg = BG_SELECT;
+
+      const labelColor = (isSelectMode || isError) ? TXT_WHITE : TXT_BLUE;
+      const nameColor = TXT_WHITE; 
+
+      if (deviceName.length > 15) deviceName = deviceName.substring(0, 13) + "...";
+      
+      // FIX: Aggressive Skalierung für Fehlermeldungen/lange Texte
+      let mainFontSize = 24;
+      if (isSelectMode) {
+          mainFontSize = 20; 
+      } else {
+          if (mainText.length > 9) mainFontSize = 18;
+          if (mainText.length > 12) mainFontSize = 14; 
+          if (mainText.length > 16) mainFontSize = 12;
+      }
+
+      // FIX: Rechtsbündige Ausrichtung bei Fehler
+      let mainTextAnchor = "start";
+      let mainTextX = "10";
+      
+      if (isError) {
+          mainTextAnchor = "end";
+          mainTextX = "190"; 
+      }
+
+      let barSvg = "";
+      if (percentage >= 0 && !isError && !isSelectMode) {
+          barSvg = `
+             <rect x="9" y="76" width="182" height="10" rx="5" ry="5" fill="none" stroke="#ffffff" stroke-width="1" />
+		        <rect x="10" y="77" width="180" height="8" fill="#333333" rx="4" ry="4"/>
+		        <rect x="10" y="77" width="${barWidth}" height="8" fill="${BLUE_COLOR}" rx="4" ry="4"/>
+          `;
+      }
+
+      let headerSvg = "";
+      
+      if (isSelectMode || isError) {
+           headerSvg = `
+           <text x="10" y="22" font-family="sans-serif" font-size="14" font-weight="600" fill="${TXT_WHITE}">
+             ${deviceName} (${modeLabel})
+           </text>`;
+      } else {
+           headerSvg = `
+           <text x="10" y="22" font-family="sans-serif" font-size="14" font-weight="600" fill="${nameColor}">
+             ${deviceName} (<tspan fill="${labelColor}">${modeLabel}</tspan>)
+           </text>`;
+      }
+
+      return `
+      <svg width="200" height="100" viewBox="0 0 200 100" xmlns="http://www.w3.org/2000/svg">
+        <rect x="0" y="0" width="200" height="100" fill="${bg}" />
+        ${headerSvg}
+        <text x="${mainTextX}" y="60" font-family="sans-serif" font-size="${mainFontSize}" font-weight="bold" fill="${TXT_WHITE}" text-anchor="${mainTextAnchor}">${mainText}</text>
+        ${barSvg}
+      </svg>`;
+  }
+}

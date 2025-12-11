@@ -1,0 +1,50 @@
+{
+	"Name": "WLED Controller",
+	"Version": "1.0.0.0",
+	"Author": "Your Name",
+	"Actions": [
+		{
+			"Name": "WLED Control",
+			"UUID": "com.holgermilz.wled-control",
+			"Icon": "imgs/actions/counter/icon",
+			"Tooltip": "Control WLED brightness, effects, and presets",
+			"PropertyInspectorPath": "ui/wled-inspector.html",
+			"Controllers": [
+				"Encoder"
+			],
+			"Encoder": {
+				"layout": "layouts/dial_bg.json",
+				"TriggerDescription": {
+					"Push": "Change Mode",
+					"Rotate": "Change Value",
+					"Touch": "Toggle Power"
+				}
+			},
+			"States": [
+				{
+					"Image": "imgs/actions/counter/key",
+					"TitleAlignment": "middle"
+				}
+			]
+		}
+	],
+	"Category": "WLED Encoder",
+	"CategoryIcon": "imgs/plugin/category-icon",
+	"CodePath": "bin/plugin.js",
+	"Description": "Control WLED instances via Stream Deck+ dials.",
+	"Icon": "imgs/plugin/marketplace",
+	"SDKVersion": 2,
+	"Software": {
+		"MinimumVersion": "6.5"
+	},
+	"OS": [
+		{
+			"Platform": "windows",
+			"MinimumVersion": "10"
+		}
+	],
+	"Nodejs": {
+		"Version": "20"
+	},
+	"UUID": "com.holgermilz.wled-control"
+}
