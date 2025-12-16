@@ -100,9 +100,17 @@ To make setup as easy as possible, this plugin includes a "Turbo Network Scanner
 * **Presets not loading:**
     * The plugin fetches `presets.json` upon connection. If you add new presets in WLED, switch profiles or restart the Stream Deck software to reload the list.
 
+## ⚠️ DISCLAIMER
+
+**USE AT YOUR OWN RISK.**
+
+This software is provided "as is", without warranty of any kind, express or implied.
+
+* **No Liability:** The author accepts **no liability** for any direct, indirect, incidental, or consequential damages resulting from the use or misuse of this plugin. This includes, but is not limited to, hardware damage (LED strips, power supplies, relays), data loss, or personal injury.
+* **Photosensitivity Warning:** This plugin allows rapid changing of light effects (including strobes and flashing patterns). Some WLED effects may trigger seizures in people with **photosensitive epilepsy**. Please use with caution.
+* **Electrical Safety:** Running LED strips at 100% brightness for extended periods can generate significant heat and load on your power supply. Ensure your wiring is safe and components are correctly rated.
+* **Affiliation:** This project is an independent community plugin and is **not** affiliated with, endorsed by, or associated with Elgato, Corsair, or the WLED project.
+
 ## License
 
 [MIT License](LICENSE)
-
----
-**Disclaimer:** This plugin is not affiliated with Elgato or the WLED project. WLED is an open-source project developed by Aircoookie and contributors.
