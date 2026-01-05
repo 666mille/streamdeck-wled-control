@@ -154,21 +154,35 @@ function validateAndSave(val) {
 function updateDropdown(devices) {
     const foundSelect = document.getElementById('foundSelect');
     const scanResult = document.getElementById('scanResult');
+    
+    
+    const currentIp = globalSettings.ipAddress;
+    const isManualIpFound = currentIp && devices.some(d => d.ip === currentIp);
+    const manualDevice = devices.find(d => d.ip === currentIp);
+
     if (scanResult) {
-        if (devices.length > 0) {
-            scanResult.textContent = `Found ${devices.length} WLED Device(s).`;
+        if (isManualIpFound && manualDevice) {
+           
+            scanResult.textContent = `Connected: ${manualDevice.name} (${manualDevice.ip})`;
             scanResult.style.color = "#4caf50"; 
+        } else if (devices.length > 0) {
+            scanResult.textContent = `Found ${devices.length} device(s) via Scan.`;
+            scanResult.style.color = "#ccc"; 
         } else {
-            scanResult.textContent = "No devices found.";
+            scanResult.textContent = "No devices found yet.";
             scanResult.style.color = "#ff9800"; 
         }
     }
+
     if (!foundSelect) return;
+    
+    
     foundSelect.innerHTML = ""; 
     const def = document.createElement('option');
     def.textContent = "-- Select Device --";
     def.value = "";
     foundSelect.appendChild(def);
+    
     devices.forEach(dev => {
         const opt = document.createElement('option');
         opt.value = dev.ip;

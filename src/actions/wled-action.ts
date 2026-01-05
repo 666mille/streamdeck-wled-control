@@ -376,6 +376,34 @@ export class WledAction extends SingletonAction<WledSettings> {
          const r2 = await this.fetchWithTimeout(`http://${ip}/presets.json`, {}, 2000);
          if(r2.ok) this.parsePresets(c, await r2.json());
       } catch(e) {}
+
+      if (c.infoName && ip) {
+          let updated = false;
+          
+          const devices = c.settings.foundDevices ? [...c.settings.foundDevices] : [];
+          
+         
+          const existingIndex = devices.findIndex(d => d.ip === ip);
+
+          if (existingIndex === -1) {
+              
+              devices.push({ ip: ip, name: c.infoName });
+              updated = true;
+          } else if (devices[existingIndex].name !== c.infoName) {
+              
+              devices[existingIndex].name = c.infoName;
+              updated = true;
+          }
+
+          
+          if (updated) {
+              const newSettings = { ...c.settings, foundDevices: devices };
+              c.settings = newSettings; 
+              if (c.action && c.action.setSettings) {
+                  c.action.setSettings(newSettings); 
+              }
+          }
+      }
       
       c.isConnectionError = false; 
       c.lastError = null;
@@ -589,7 +617,8 @@ export class WledAction extends SingletonAction<WledSettings> {
   }
 
   private genSvg(name: string, label: string, val: string, err: boolean, sel: boolean, pct: number, isOn: boolean, settings: WledSettings): string {
-      let BG = "#000000";
+      //let BG = "#000000";
+      let BG = "transparent";
       
       if (err) {
           if (settings && settings.showOfflineColor) BG = settings.offlineColor || "#FF9800";
