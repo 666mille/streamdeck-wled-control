@@ -8,7 +8,10 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# OS(Müll) 
+# Backups
+*.bak
+
+# OS(Mï¿½ll) 
 Thumbs.db
 Desktop.ini
 
@@ -18,7 +21,7 @@ Desktop.ini
 # Logs innerhalb des Plugins
 *.sdPlugin/logs/
 
-# Gehört in die "Releases" auf GitHub
+# Gehï¿½rt in die "Releases" auf GitHub
 *.streamDeckPlugin
 
 # IDE Settings 

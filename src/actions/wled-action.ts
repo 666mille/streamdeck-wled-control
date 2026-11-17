@@ -9,7 +9,6 @@ import streamDeck, {
   type TouchTapEvent,
   type SendToPluginEvent,
   type JsonObject,
-  LogLevel,
 } from "@elgato/streamdeck";
 import { Buffer } from "node:buffer";
 import * as os from "node:os"; 
@@ -56,6 +55,25 @@ interface ContextCache {
   hasRelayUsermod: boolean; 
   relayState: boolean; 
   lastToggleTime: number;
+  pollGen: number;        // Generation: verhindert doppelte / verwaiste Poll-Schleifen
+  visible: boolean;
+  listsLoadedAt: number;  // Zeitpunkt, an dem Effekte/Paletten/Presets zuletzt geladen wurden
+}
+
+const POLL_INTERVAL_MS = 3000;
+const LIST_REFRESH_MS = 60000;
+
+function escapeXml(s: string): string {
+  return String(s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+
+/** Promise "fire & forget" – aber Fehler werden geloggt statt als unhandledRejection zu enden. */
+function safe(p: unknown, what: string): void {
+  if (p && typeof (p as Promise<unknown>).catch === "function") {
+    (p as Promise<unknown>).catch((e) => log.warn(`${what} failed`, e));
+  }
 }
 
 const log = streamDeck.logger.createScope("WledAction");
@@ -64,11 +82,26 @@ const log = streamDeck.logger.createScope("WledAction");
 export class WledAction extends SingletonAction<WledSettings> {
   private cache = new Map<string, ContextCache>();
   private selectModeTimeouts = new Map<string, NodeJS.Timeout>();
+  private disposed = false;
+  private scanning = false;
+
+  /** Stoppt alle Timer – wird beim Beenden des Plugins aufgerufen. */
+  public dispose(): void {
+    this.disposed = true;
+    for (const [id, c] of this.cache) {
+      this.stopPolling(c);
+      this.clearSelectTimeout(id);
+      c.action = null;
+    }
+  }
 
   // TURBO NETWORK SCANNER
   override async onSendToPlugin(ev: SendToPluginEvent<WledSettings, JsonObject>): Promise<void> {
     const payload = ev.payload as any;
-    if (payload.event === "startScan") {
+    if (payload?.event === "startScan") {
+      if (this.scanning) return;
+      this.scanning = true;
+      try {
         const subnets = this.getLocalSubnets();
         subnets.sort((a, b) => {
              const prio = ["192.168.178", "192.168.1", "192.168.0"];
@@ -81,9 +114,14 @@ export class WledAction extends SingletonAction<WledSettings> {
         const cached = this.cache.get(contextId);
         if (cached) {
             const newSettings: WledSettings = { ...cached.settings, foundDevices: devices };
-            await ev.action.setSettings(newSettings);
             cached.settings = newSettings;
+            await ev.action.setSettings(newSettings);
         }
+      } catch (e) {
+        log.warn("Scan failed", e);
+      } finally {
+        this.scanning = false;
+      }
     }
   }
 
@@ -123,9 +161,8 @@ export class WledAction extends SingletonAction<WledSettings> {
 
   private async checkWledIp(ip: string): Promise<{ip: string, name: string} | null> {
     try {
-        const res = await this.fetchWithTimeout(`http://${ip}/json/info`, {}, 1500); 
-        if (res.ok) {
-            const data = (await res.json()) as any;
+        const data = await this.fetchJson(`http://${ip}/json/info`, 1500);
+        if (data && typeof data === "object" && ("ver" in data || "leds" in data)) {
             return { ip: ip, name: data.name || "Unknown WLED" };
         }
     } catch (e) { }
@@ -143,14 +180,17 @@ export class WledAction extends SingletonAction<WledSettings> {
     return clean || null;
   }
 
-  private async fetchWithTimeout(url: string, options: RequestInit = {}, timeout = 2500): Promise<Response> {
+  /** fetch + JSON-Parsing; der Timeout gilt für Header UND Body. */
+  private async fetchJson(url: string, timeout = 2500, options: RequestInit = {}): Promise<any> {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeout);
     try {
-        const response = await fetch(url, { ...options, signal: controller.signal });
-        return response;
+        const res = await fetch(url, { ...options, signal: controller.signal });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const text = await res.text();
+        return text ? JSON.parse(text) : null;
     } catch (e: any) {
-        if (e.name === 'AbortError') throw new Error("Timeout");
+        if (e?.name === 'AbortError') throw new Error("Timeout");
         throw e;
     } finally { clearTimeout(id); }
   }
@@ -166,6 +206,7 @@ export class WledAction extends SingletonAction<WledSettings> {
   private startSelectTimeout(actionObj: any, context: string) {
       this.clearSelectTimeout(context);
       const t = setTimeout(() => {
+          this.selectModeTimeouts.delete(context);
           const c = this.cache.get(context);
           if (c && c.selectionActive) {
               c.selectionActive = false; 
@@ -199,13 +240,18 @@ export class WledAction extends SingletonAction<WledSettings> {
         pendingMode: s.mode || "BRIGHTNESS",
         hasRelayUsermod: false,
         relayState: false,
-        lastToggleTime: 0 // Init
+        lastToggleTime: 0,
+        pollGen: 0,
+        visible: true,
+        listsLoadedAt: 0,
       });
     } else {
         const c = this.cache.get(ev.action.id)!; 
+        if (c.ip !== valid) c.listsLoadedAt = 0;
         c.ip = valid; 
         c.action = ev.action; 
         c.settings = s;
+        c.visible = true;
         if (!valid) {
             c.isConnectionError = true;
             c.lastError = "Setup Req.";
@@ -222,9 +268,11 @@ export class WledAction extends SingletonAction<WledSettings> {
 
   override onWillDisappear(ev: WillDisappearEvent<WledSettings>): void {
     const c = this.cache.get(ev.action.id);
-    if (c && c.pollTimer) {
-        clearTimeout(c.pollTimer);
-        c.pollTimer = null;
+    if (c) {
+        c.visible = false;
+        c.action = null;
+        c.selectionActive = false;
+        this.stopPolling(c);
     }
     this.clearSelectTimeout(ev.action.id);
   }
@@ -236,15 +284,16 @@ export class WledAction extends SingletonAction<WledSettings> {
     
     const c = this.cache.get(ev.action.id);
     if(c) { 
+        if (c.ip !== valid) c.listsLoadedAt = 0;
         c.ip = valid; 
         c.action = ev.action; 
         c.settings = s; 
         if(s.mode) c.currentMode = s.mode; 
         
         if (valid) {
-            if (c.pollTimer) clearTimeout(c.pollTimer);
             this.startPolling(ev.action.id);
         } else {
+            this.stopPolling(c);
             c.isConnectionError = true;
             c.lastError = "Setup Req.";
             this.updateDisplay(ev.action, ev.action.id);
@@ -261,7 +310,8 @@ export class WledAction extends SingletonAction<WledSettings> {
           this.clearSelectTimeout(ev.action.id);
           c.selectionActive = false;
           c.currentMode = c.pendingMode;
-          ev.action.setSettings({ ...c.settings, mode: c.currentMode });
+          c.settings = { ...c.settings, mode: c.currentMode };
+          safe(ev.action.setSettings(c.settings), "setSettings");
           this.updateDisplay(ev.action, ev.action.id);
       } else {
           c.selectionActive = true;
@@ -313,31 +363,42 @@ export class WledAction extends SingletonAction<WledSettings> {
   }
 
   // ROBUST POLLING
-  private startPolling(contextId: string) {
-    const c = this.cache.get(contextId);
-    if (!c || !c.ip) return;
-
+  private stopPolling(c: ContextCache) {
+    c.pollGen++;               // laufende Schleife beendet sich nach ihrem aktuellen Request
     if (c.pollTimer) clearTimeout(c.pollTimer);
-
-    const pollLoop = async () => {
-        const currentC = this.cache.get(contextId);
-        if (!currentC || !currentC.ip) return;
-
-        try {
-            await this.fetchAll(contextId, currentC.ip);
-        } catch (e) { }
-        
-        currentC.pollTimer = setTimeout(pollLoop, 3000);
-    };
-    pollLoop();
+    c.pollTimer = null;
   }
 
-  private async fetchAll(context: string, ip: string) {
+  private startPolling(contextId: string) {
+    const c = this.cache.get(contextId);
+    if (!c || !c.ip || this.disposed) return;
+
+    this.stopPolling(c);
+    const gen = c.pollGen;
+
+    const alive = () => !this.disposed && c.visible && c.pollGen === gen && this.cache.get(contextId) === c;
+
+    const pollLoop = async () => {
+        c.pollTimer = null;
+        if (!alive() || !c.ip) return;
+        try {
+            await this.fetchAll(contextId, c.ip, alive);
+        } catch (e) {
+            log.warn("poll failed", e);
+        }
+        if (alive()) c.pollTimer = setTimeout(pollLoop, POLL_INTERVAL_MS);
+    };
+    void pollLoop();
+  }
+
+  private async fetchAll(context: string, ip: string, alive: () => boolean = () => true) {
     const c = this.cache.get(context); if(!c) return;
     try {
-      const res = await this.fetchWithTimeout(`http://${ip}/json`, {}, 3000); 
-      if(!res.ok) throw new Error(`${res.status}`);
-      const data = (await res.json()) as any;
+      // Effekt-/Palettenlisten sind groß -> nur beim ersten Mal, nach Fehlern oder alle 60 s laden.
+      const needLists = c.isConnectionError || c.listsLoadedAt === 0 || (Date.now() - c.listsLoadedAt) > LIST_REFRESH_MS;
+      const data = await this.fetchJson(needLists ? `http://${ip}/json` : `http://${ip}/json/si`, 3000);
+      if (!alive()) return;   // Action inzwischen weg / Plugin beendet / neue IP
+      if (!data || typeof data !== "object") throw new Error("Invalid JSON");
       
       if(data.state) {
           c.state = data.state;
@@ -348,7 +409,7 @@ export class WledAction extends SingletonAction<WledSettings> {
               c.hasRelayUsermod = true;
               relayCount = c.state.MultiRelay.relays.length;
               
-              const targetId = parseInt(c.settings.relayId || "0");
+              const targetId = parseInt(c.settings.relayId || "0", 10) || 0;
               const relayObj = c.state.MultiRelay.relays.find((r: any) => r.relay === targetId);
               if (relayObj) {
                   c.relayState = relayObj.state;
@@ -362,20 +423,24 @@ export class WledAction extends SingletonAction<WledSettings> {
 
           if (c.settings.relayCount !== relayCount || c.settings.hasMultiRelay !== c.hasRelayUsermod) {
               const newSettings = { ...c.settings, hasMultiRelay: c.hasRelayUsermod, relayCount: relayCount };
-              if (c.action && c.action.setSettings) {
-                  c.action.setSettings(newSettings);
-              }
               c.settings = newSettings;
+              if (c.action && c.action.setSettings) {
+                  safe(c.action.setSettings(newSettings), "setSettings");
+              }
           }
       } 
 
-      if(data.info) c.infoName = data.info.name;
+      if(data.info && data.info.name) c.infoName = String(data.info.name);
       if(Array.isArray(data.effects)) c.effects = data.effects;
       if(Array.isArray(data.palettes)) c.palettes = data.palettes;
-      try {
-         const r2 = await this.fetchWithTimeout(`http://${ip}/presets.json`, {}, 2000);
-         if(r2.ok) this.parsePresets(c, await r2.json());
-      } catch(e) {}
+      if (needLists) {
+          try {
+             const presets = await this.fetchJson(`http://${ip}/presets.json`, 2000);
+             if (!alive()) return;
+             this.parsePresets(c, presets);
+          } catch(e) {}
+          c.listsLoadedAt = Date.now();
+      }
 
       if (c.infoName && ip) {
           let updated = false;
@@ -400,7 +465,7 @@ export class WledAction extends SingletonAction<WledSettings> {
               const newSettings = { ...c.settings, foundDevices: devices };
               c.settings = newSettings; 
               if (c.action && c.action.setSettings) {
-                  c.action.setSettings(newSettings); 
+                  safe(c.action.setSettings(newSettings), "setSettings");
               }
           }
       }
@@ -410,14 +475,11 @@ export class WledAction extends SingletonAction<WledSettings> {
       if (c.action) this.updateDisplay(c.action, context);
 
     } catch (e: unknown) { 
+        if (!alive()) return;
         c.isConnectionError = true; 
         c.lastError = "Offline";
         if (c.action) this.updateDisplay(c.action, context); 
     }
-  }
-
-  private async fetchState(id: string, ip: string) {
-     
   }
 
   private parsePresets(c: ContextCache, d: any) {
@@ -432,10 +494,11 @@ export class WledAction extends SingletonAction<WledSettings> {
      l.sort((a,b) => a.id - b.id); c.presets = l;
   }
 
-  private async sendJson(ip: string, d: any) { 
-      try { 
-          await fetch(`http://${ip}/json/state`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(d) });
-      } catch (e) { } 
+  private sendJson(ip: string, d: any): void {
+      if (this.disposed) return;
+      this.fetchJson(`http://${ip}/json/state`, 2500, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(d)
+      }).catch(() => { /* Gerät offline – nächste Poll-Runde zeigt NO CONN */ });
   }
 
   // ACTIONS
@@ -454,17 +517,17 @@ export class WledAction extends SingletonAction<WledSettings> {
   }
   
   private changeEffect(a: any, c: ContextCache, t: number) {
-     if(!c.state || !c.effects.length) return; 
-     let f = (c.state.seg[0]?.fx || 0) + t;
-     if (f >= c.effects.length) f = 0; if (f < 0) f = c.effects.length - 1;
+     if(!c.state || !c.effects.length || !Array.isArray(c.state.seg) || !c.state.seg[0]) return; 
+     let f = (c.state.seg[0].fx || 0) + t;
+     f = ((f % c.effects.length) + c.effects.length) % c.effects.length;
      c.state.seg[0].fx = f; 
      this.sendJson(c.ip!, { seg: [{ id: 0, fx: f }] }); this.updateDisplay(a, a.id);
   }
   
   private changePalette(a: any, c: ContextCache, t: number) {
-     if(!c.state || !c.palettes.length) return; 
-     let p = (c.state.seg[0]?.pal || 0) + t;
-     if (p >= c.palettes.length) p = 0; if (p < 0) p = c.palettes.length - 1;
+     if(!c.state || !c.palettes.length || !Array.isArray(c.state.seg) || !c.state.seg[0]) return; 
+     let p = (c.state.seg[0].pal || 0) + t;
+     p = ((p % c.palettes.length) + c.palettes.length) % c.palettes.length;
      c.state.seg[0].pal = p;
      this.sendJson(c.ip!, { seg: [{ id: 0, pal: p }] }); this.updateDisplay(a, a.id);
   }
@@ -474,7 +537,7 @@ export class WledAction extends SingletonAction<WledSettings> {
      let currentPs = c.state ? c.state.ps : 0;
      let idx = c.presets.findIndex(p => p.id === currentPs);
      if (idx === -1) idx = 0; 
-     idx += t; if (idx >= c.presets.length) idx = 0; if (idx < 0) idx = c.presets.length - 1;
+     idx = (((idx + t) % c.presets.length) + c.presets.length) % c.presets.length;
      const p = c.presets[idx]; 
      if (c.state) c.state.ps = p.id; 
      this.sendJson(c.ip!, { ps: p.id }); 
@@ -485,7 +548,7 @@ export class WledAction extends SingletonAction<WledSettings> {
   private changeRelay(a: any, c: ContextCache, t: number) {
       if (!c.hasRelayUsermod) return; 
       
-      const relayId = parseInt(c.settings.relayId || "0");
+      const relayId = parseInt(c.settings.relayId || "0", 10) || 0;
       const newState = t > 0;
       
       if (c.relayState !== newState) {
@@ -532,7 +595,7 @@ export class WledAction extends SingletonAction<WledSettings> {
   // DISPLAY
   private updateDisplay(a: any, id: string) {
     const c = this.cache.get(id); 
-    if(!a || !c) return;
+    if(!a || !c || this.disposed || !c.visible) return;
 
     const s = c.settings || {};
 
@@ -613,7 +676,7 @@ export class WledAction extends SingletonAction<WledSettings> {
   private sendSvg(a: any, name: string, label: string, val: string, err: boolean, sel: boolean, pct: number, isOn: boolean, settings: WledSettings) {
       const svg = this.genSvg(name, label, val, err, sel, pct, isOn, settings);
       const b64 = `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
-      a.setFeedback({ full_display: b64, title: "", value: "", indicator: { value: 0, enabled: false } });
+      safe(a.setFeedback({ full_display: b64, title: "", value: "", indicator: { value: 0, enabled: false } }), "setFeedback");
   }
 
   private genSvg(name: string, label: string, val: string, err: boolean, sel: boolean, pct: number, isOn: boolean, settings: WledSettings): string {
@@ -621,7 +684,10 @@ export class WledAction extends SingletonAction<WledSettings> {
       let BG = "transparent";
       
       if (err) {
-          if (settings && settings.showOfflineColor) BG = settings.offlineColor || "#FF9800";
+          if (settings && settings.showOfflineColor) {
+              const oc = String(settings.offlineColor || "");
+              BG = /^#[0-9a-fA-F]{3,8}$/.test(oc) ? oc : "#FF9800";
+          }
       } else if (sel) { 
           BG = "#3984E9"; 
       }
@@ -676,10 +742,10 @@ export class WledAction extends SingletonAction<WledSettings> {
       return `<svg width="200" height="100" viewBox="0 0 200 100" xmlns="http://www.w3.org/2000/svg">
         <rect width="200" height="100" fill="${BG}"/>
         <text x="5" y="22" text-anchor="start" font-family="sans-serif" font-size="14" font-weight="600" fill="${TITLE_CLR}">
-            ${name} (<tspan fill="${LABEL_CLR}">${label}</tspan>)
+            ${escapeXml(name)} (<tspan fill="${LABEL_CLR}">${escapeXml(label)}</tspan>)
         </text>
         <text x="127" y="60" text-anchor="middle" font-family="sans-serif" font-size="${fs}" font-weight="bold" fill="${VAL_CLR}">
-            ${val}
+            ${escapeXml(val)}
         </text>
         ${subText}
         ${bar}
